@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS Metadata
+.DS_Store
+Thumbs.db
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Large LiDAR point clouds
+*.las
+*.laz
+
+# Generated outputs
+*qc_summary.txt
+qc_summary.txt
+report.html
+qc_report.html
+*report_density.png
+report_density.png
+*density.png
+density.png
+
+# Local development packages
+node_modules/
+package-lock.json
+package.json
