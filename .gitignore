@@ -13,21 +13,42 @@ venv/
 ENV/
 env/
 
+# IDE and OS
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+
 # Large LiDAR point clouds
 *.las
 *.laz
+# Committed downsampled demo tile (see scripts/make_sample.py)
+!data/sample.laz
 
 # Generated outputs
 *qc_summary.txt
-qc_summary.txt
 report.html
 qc_report.html
 *report_density.png
-report_density.png
 *density.png
-density.png
 
 # Local development packages
 node_modules/
 package-lock.json
 package.json
+
+# Python build artifacts
+dist/
+build/
+
+/reviews
+
+/las_inspector.egg-info
+
+
+/docs
+
+/data
+# Exception: committed downsampled demo tile (see scripts/make_sample.py)
+!data/sample.laz

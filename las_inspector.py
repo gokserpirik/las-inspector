@@ -4,7 +4,7 @@ las-inspector — Automated LiDAR QC reports from your terminal.
 
 Usage:
     python las_inspector.py input.laz --output report.html
-    python las_inspector.py survey.laz --output qc.html --density --overlap-check
+    python las_inspector.py survey.laz --output qc.html --density
 
 Reads any LAS/LAZ file and produces a client-ready quality report:
   - Point statistics (count, density, returns, classification breakdown)
@@ -1058,13 +1058,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent("""\
             Examples:
               python las_inspector.py input.laz --output report.html
-              python las_inspector.py survey.laz --density --overlap-check
+              python las_inspector.py survey.laz --density
         """),
     )
     parser.add_argument("input", help="Path to LAS/LAZ file")
     parser.add_argument("--output", "-o", default=None, help="Output HTML report path")
     parser.add_argument("--density", action="store_true", help="Generate density heatmap (PNG)")
-    parser.add_argument("--overlap-check", action="store_true", help="Run overlap detection")
     parser.add_argument("--max-points", type=int, default=None, help="Max points to read (for testing)")
     return parser
 
@@ -1104,21 +1103,25 @@ def main(argv: list[str] | None = None) -> int:
     # Density PNG
     # Generate qc_summary.txt (like main.py)
     summary_path = os.path.splitext(os.path.basename(input_path))[0] + "_qc_summary.txt"
-    with open(summary_path, "w") as f:
-        f.write(f"QC Report: {os.path.basename(input_path)}\n")
-        f.write(f"Total Points: {hdr.point_count:,}\n")
-        f.write(f"Point Density: {stats.point_density:.2f} pts/m²\n")
-        f.write(f"Bounds: X={hdr.min_x:.3f}..{hdr.max_x:.3f}, "
-                f"Y={hdr.min_y:.3f}..{hdr.max_y:.3f}, "
-                f"Z={hdr.min_z:.3f}..{hdr.max_z:.3f}\n")
-        f.write(f"CRS: {hdr.crs_wkt[:60] if hdr.crs_wkt else 'Not detected'}\n")
-        f.write(f"Classifications: {len(stats.classification_counts)}\n")
-        f.write(f"Withheld points: {stats.withheld_count}\n")
-        f.write(f"Synthetic points: {stats.synthetic_count}\n")
-        n_err = sum(1 for w in warnings if w.severity == "error")
-        n_warn = sum(1 for w in warnings if w.severity == "warning")
-        verdict = "FAILED" if n_err or n_warn else "PASSED"
-        f.write(f"QC Verdict: {verdict}\n")
+    try:
+        with open(summary_path, "w") as f:
+            f.write(f"QC Report: {os.path.basename(input_path)}\n")
+            f.write(f"Total Points: {hdr.point_count:,}\n")
+            f.write(f"Point Density: {stats.point_density:.2f} pts/m²\n")
+            f.write(f"Bounds: X={hdr.min_x:.3f}..{hdr.max_x:.3f}, "
+                    f"Y={hdr.min_y:.3f}..{hdr.max_y:.3f}, "
+                    f"Z={hdr.min_z:.3f}..{hdr.max_z:.3f}\n")
+            f.write(f"CRS: {hdr.crs_wkt[:60] if hdr.crs_wkt else 'Not detected'}\n")
+            f.write(f"Classifications: {len(stats.classification_counts)}\n")
+            f.write(f"Withheld points: {stats.withheld_count}\n")
+            f.write(f"Synthetic points: {stats.synthetic_count}\n")
+            n_err = sum(1 for w in warnings if w.severity == "error")
+            n_warn = sum(1 for w in warnings if w.severity == "warning")
+            verdict = "FAILED" if n_err or n_warn else "PASSED"
+            f.write(f"QC Verdict: {verdict}\n")
+    except IOError as e:
+        print(f"❌ Write error ({summary_path}): {e}", file=sys.stderr)
+        return 1
     print(f"📝 Summary → {summary_path}")
 
     # Density PNG
@@ -1134,8 +1137,12 @@ def main(argv: list[str] | None = None) -> int:
     output_path = args.output or "qc_report.html"
     print(f"📄 Generating report → {output_path} ...")
     html = generate_html_report(las, stats, warnings, density_png_path=density_png, filename=las.filename)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html)
+    except IOError as e:
+        print(f"❌ Write error ({output_path}): {e}", file=sys.stderr)
+        return 1
 
     print(f"✅ Done — report written to {output_path}")
     if not warnings:

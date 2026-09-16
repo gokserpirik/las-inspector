@@ -2,11 +2,12 @@
 
 A lightweight Python CLI tool designed to ingest standard ASPRS LAS/LAZ point cloud files, run automated quality control checks, and generate interactive, client-ready HTML reports complete with spatial density heatmaps and elevation profiles.
 
-> ℹ️
-> This is a portfolio demonstration and proof of concept. It is not intended for commercial engineering, large-scale production, or high-precision survey audits.
+![las-inspector QC report](report-preview.png)
 
-> ⚠️
-> This repository serves as a showcase of using AI as a software engineering force multiplier, contrasting a basic prototyping script (`main.py`) with a custom, high-performance binary parsing CLI tool (`las_inspector.py`). The code and documentation were developed in partnership with AI to demonstrate low-level byte parsing and rapid CLI tool optimization.
+> 📄 **[View a live example report](https://gokserpirik.github.io/las-inspector/example-report.html)** — or open [`example-report.html`](example-report.html) locally.
+
+> ℹ️
+> I started this as an experiment to understand low-level ASPRS binary formats and memory-efficient NumPy arrays. It ended up robust and useful enough to become a general-purpose QC CLI — a portfolio piece showing how AI multiplies a solo engineer's output, contrasting a basic prototype (`main.py`) with a custom binary-parsing tool (`las_inspector.py`).
 
 ---
 
@@ -28,7 +29,7 @@ To run the pipeline with your own data:
 While professional civil engineering projects typically rely on feature-rich CAD suites (like Autodesk Civil 3D) or GIS software (like ArcGIS Pro) to inspect LiDAR files, this lightweight Python CLI workflow offers key practical advantages for specific use cases:
 
 1. **Zero Licensing Cost:** It uses free, open-source libraries (`numpy`, `matplotlib`, `lazrs`). Anyone can inspect point clouds without purchasing expensive proprietary CAD/GIS software licenses.
-2. **Speed & Low Overhead:** Heavy CAD programs can take minutes to load massive datasets and often freeze on standard laptops. This script loads, parses headers, and runs QC checks in seconds using custom binary decoding and memory-efficient NumPy arrays.
+2. **Low Overhead:** Heavy CAD programs can take minutes to load massive datasets and often freeze on standard laptops. This script starts instantly, parses headers with custom binary decoding, and runs QC checks with memory-efficient NumPy arrays — no GUI, no license server, no project setup.
 3. **Easy Automation & CI/CD Pipelines:** Because it is a simple terminal command-line tool, it can easily be scheduled (e.g., cron jobs), integrated into automated file pipelines, or run as an automated check (pre-commit hooks or GitHub Actions) on newly received survey tiles.
 4. **Transparency & Customizability:** All QC thresholds (like density limits and classification ratios) are explicitly written in code. This provides a clear, reproducible calculation logic rather than a "black-box" proprietary algorithm.
 
@@ -62,7 +63,7 @@ A civil engineering firm is working on a municipal subdivision project. Every we
 
 ### 🧠 AI Co-Pilot Case Study: Baseline vs. Enhanced
 
-This repository serves as a showcase of using AI as a force multiplier for software engineering, contrasting a basic prototyping script with a custom, high-performance binary parsing CLI tool.
+This repository serves as a showcase of using AI as a force multiplier for software engineering, contrasting a basic prototyping script with a custom binary-parsing CLI tool.
 
 | Feature | Baseline Script (`main.py`) | Enhanced CLI Tool (`las_inspector.py`) |
 | :--- | :--- | :--- |
@@ -100,6 +101,19 @@ Developing the enhanced CLI tool involved deep diving into the ASPRS LAS specifi
 
 ---
 
+## ⏱️ Benchmarks
+
+Honest numbers first: `laspy` (native C++/Rust parsing) beats this tool's pure-Python parser at raw point parsing. The win here is workflow overhead — no GUI, no license, instant startup, scriptable — not CPU throughput. Reproduce with `python scripts/benchmark.py <file> --repeat 3`:
+
+| Workload (`las2018.laz`, 2.2M pts, LAS 1.4) | Mean | Best of 3 |
+| :--- | :--- | :--- |
+| `las_inspector.read_las` + `compute_stats` | 4.25 s | 4.13 s |
+| `laspy.read` + NumPy stats | 0.24 s | 0.23 s |
+
+Takeaway: if you need maximum parse throughput, use `laspy` (or PDAL). If you need a one-command QC verdict plus a portable client report with zero setup, this tool earns its keep. A header-only fast path (skip point records when only bounds/density estimates are needed) is planned future work.
+
+---
+
 ## ⚙️ Configuration & Parameters
 
 To customize the CLI run behavior and thresholds, adjust the command-line options or modify the warning heuristics within `las_inspector.py`:
@@ -107,9 +121,9 @@ To customize the CLI run behavior and thresholds, adjust the command-line option
 ### CLI Flags & Arguments
 * **`input` (positional):** Path to the raw `.las` or `.laz` file.
 * **`--output`, `-o`:** Name of the output HTML report (defaults to `qc_report.html`).
-* **`--density`:** Generates a dual-plot PNG showing the 2D Point Density heatmap and 3D Elevation map.
-* **`--overlap-check`:** Runs a heuristic check for flight line overlap zones.
+* **`--density`:** Generates a dual-plot PNG showing the 2D Point Density heatmap and terrain-colored elevation scatter.
 * **`--max-points`:** Limits the number of points processed (useful for rapid testing on massive files).
+* **Overlap detection:** runs automatically on every file — possible flight-line overlap zones are reported as info-level warnings.
 
 ### Modifying Heuristic Thresholds
 Open `las_inspector.py` and modify the following conditional checks in `compute_stats()` to fit your project standards:
@@ -136,31 +150,51 @@ Open `las_inspector.py` and modify the following conditional checks in `compute_
 ## 🚀 Quick Start
 
 ### Prerequisites
-* Python 3.10 or newer
-* [uv](https://github.com/astral-sh/uv) (recommended) or `pip`
+* Python 3.12 or newer
+* [uv](https://github.com/astral-sh/uv) (recommended) or `pip`/`pipx`
 
 ### Install & Run
 1. Clone this repository.
-2. Place your LAS/LAZ file in the folder.
-3. Install dependencies and run:
+2. Try it immediately on the bundled sample tile (`data/sample.laz`, ~100k points, 1.2 MB):
 
 ```bash
 # Using uv:
 uv sync
 source .venv/bin/activate
-python las_inspector.py las2018.laz --density --output qc_report.html
+las-inspector data/sample.laz --density --output qc_report.html
+
+# Or install as a standalone tool with pipx (no clone needed):
+pipx install git+https://github.com/gokserpirik/las-inspector.git
+las-inspector your-tile.laz --density  # point it at your own .las/.laz file
 
 # Or using standard pip:
 pip install -r requirements.txt
-python las_inspector.py las2018.laz --density --output qc_report.html
+python las_inspector.py data/sample.laz --density --output qc_report.html
 ```
+
+To build the sample yourself from a large tile: `python scripts/make_sample.py las2018.laz --output data/sample.laz --stride 22`.
 
 ### Output Files & Visualizations
 
-The script generates three key deliverables:
+The script generates three key deliverables (names derive from your input/output paths):
 
 1. **`qc_report.html`**: A standalone, semantic HTML5 report with responsive dark-mode styling, Google Fonts typography, interactive cards, and a detailed summary of point count, CRS, and returns. If `--density` is enabled, the visualization is embedded directly into this file.
-2. **`las2018_qc_summary.txt`**: A clean, lightweight text file summary saved directly to the working directory for quick inspection or piping to other tools.
-3. **`report_density.png`**: (Only generated with `--density`) A dual-panel figure mapping point density per bin next to a terrain-colored elevation scatter plot.
+2. **`<input>_qc_summary.txt`** (e.g. `sample_qc_summary.txt`): A clean, lightweight text file summary saved to the working directory for quick inspection or piping to other tools.
+3. **`<output>_density.png`** (only with `--density`): A dual-panel figure mapping point density per bin next to a terrain-colored elevation scatter plot.
 
-![LiDAR Density and Elevation Plots](report_density.png)
+![LiDAR Density and Elevation Plots](sample-plots.png)
+
+---
+
+## 🧪 Running Tests
+
+```bash
+uv sync
+.venv/bin/python -m pytest tests/ -v
+```
+
+40 tests covering header math, bitfield unpacking, QC stats, binary LAS parsing, reports, and the CLI.
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE).
