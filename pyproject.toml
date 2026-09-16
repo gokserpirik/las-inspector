@@ -6,12 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "las-inspector"
 version = "0.1.0"
 description = "ASPRS LAS/LAZ quality control inspector"
+authors = [
+    {name = "Gökser Pirik"}
+]
 requires-python = ">=3.12"
 license = {file = "LICENSE"}
 readme = "README.md"
 keywords = ["lidar", "point-cloud", "las", "laz", "quality-control"]
 dependencies = [
-    "numpy>=1.20.0,<2.0.0",
+    "numpy>=1.20.0,<3.0.0",
     "matplotlib>=3.4.0,<4.0.0",
     "lazrs>=0.5.0,<1.0.0",
     "laspy>=2.0.0,<3.0.0",
