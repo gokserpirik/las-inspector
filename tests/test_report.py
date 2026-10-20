@@ -34,6 +34,7 @@ def test_html_report_contents(las_file):
     assert "Low point density" in html
     assert "Ground" in html
     assert "pts/m²" in html
+    assert "https://github.com/gokserpirik/las-inspector" in html
 
 
 def test_html_report_clean_verdict():
