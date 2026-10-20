@@ -2,9 +2,9 @@
 
 A lightweight Python CLI tool designed to ingest standard ASPRS LAS/LAZ point cloud files, run automated quality control checks, and generate interactive, client-ready HTML reports complete with spatial density heatmaps and elevation profiles.
 
-![las-inspector QC report](report-preview.png)
+![las-inspector QC report](https://raw.githubusercontent.com/gokserpirik/las-inspector/main/report-preview.png)
 
-![3D WebGL point cloud viewer and corridor cross-section profile](report-preview-3d.png)
+![3D WebGL point cloud viewer and corridor cross-section profile](https://raw.githubusercontent.com/gokserpirik/las-inspector/main/report-preview-3d.png)
 
 > 📄 **[View a live example report](https://gokserpirik.github.io/las-inspector/example-report.html)** — or open [`example-report.html`](example-report.html) locally.
 
@@ -197,7 +197,7 @@ The script generates three key deliverables (names derive from your input/output
 2. **`<input>_qc_summary.txt`** (e.g. `sample_qc_summary.txt`): A clean, lightweight text file summary saved to the working directory for quick inspection or piping to other tools.
 3. **`<output>_density.png`** (only with `--density`): A dual-panel figure mapping point density per bin next to a terrain-colored elevation scatter plot.
 
-![LiDAR Density and Elevation Plots](sample-plots.png)
+![LiDAR Density and Elevation Plots](https://raw.githubusercontent.com/gokserpirik/las-inspector/main/sample-plots.png)
 
 ---
 
