@@ -80,3 +80,41 @@ def test_empty_file_does_not_crash():
     assert stats.total_points == 0
     assert stats.intensity_range == (0, 0)
     assert any(w.category == "classification" for w in warnings)
+
+
+def test_overlap_detected_by_multipass_gps_cells():
+    # Two passes over the same area, 1000 s apart -> multi-pass cells.
+    pts = []
+    for t0 in (1000.0, 2000.0):
+        for i in range(4000):
+            pts.append(
+                make_point(x=(i % 80) * 0.125, y=(i // 80) * 0.2, classification=2,
+                           return_number=2, number_of_returns=2, gps_time=t0 + i * 0.001)
+            )
+    las = make_las(pts, max_x=10.0, max_y=9.0)
+    stats, warnings = compute_stats(las)
+    assert stats.overlaps_detected is True
+    assert any(w.category == "overlap" and "distinct passes" in w.message for w in warnings)
+
+
+def test_no_overlap_for_single_pass_uniform_grid():
+    pts = [
+        make_point(x=(i % 80) * 0.125, y=(i // 80) * 0.2, classification=2,
+                   return_number=2, number_of_returns=2, gps_time=1000.0 + i * 0.001)
+        for i in range(4000)
+    ]
+    las = make_las(pts, max_x=10.0, max_y=9.0)
+    stats, _ = compute_stats(las)
+    assert stats.overlaps_detected is False
+
+
+def test_single_stray_timestamp_is_not_overlap():
+    # One pass plus a handful of stray timestamps hours away must not flag overlap.
+    pts = [
+        make_point(x=(i % 80) * 0.125, y=(i // 80) * 0.2, classification=2,
+                   return_number=2, number_of_returns=2,
+                   gps_time=1000.0 + i * 0.001 + (5000.0 if i % 200 == 0 else 0.0))
+        for i in range(4000)
+    ]
+    stats, _ = compute_stats(make_las(pts, max_x=10.0, max_y=9.0))
+    assert stats.overlaps_detected is False

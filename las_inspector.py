@@ -17,7 +17,9 @@ Reads any LAS/LAZ file and produces a client-ready quality report:
 from __future__ import annotations
 
 import argparse
+import base64
 import io
+import json
 import math
 import os
 import struct
@@ -450,6 +452,73 @@ class LasStats:
     overlaps_detected: bool = False
 
 
+def _detect_overlap_cells(
+    pts: list[PointRecord],
+    grid: int = 32,
+    min_points: int = 1000,
+    gap_seconds: float = 120.0,
+    min_pass_fraction: float = 0.10,
+) -> str | None:
+    """Detect flight-line overlap via 2D spatial binning (np.histogram2d).
+
+    Two independent signals are checked on populated bins:
+      * multi-pass cells: GPS times inside a bin split into >= 2 distinct passes, i.e. by a
+        gap > ``gap_seconds`` (flight-line turnaround) with each pass holding at least
+        ``min_pass_fraction`` of the cell's points (and >= 3 points), so one stray
+        timestamp is not enough
+      * density spikes: bins whose count exceeds 2x the median populated-bin count
+        (bimodal density, typical of overlapping swaths)
+    Returns a warning message, or None if no overlap is evident / data too small.
+    """
+    if len(pts) < min_points:
+        return None
+
+    xs = np.fromiter((p.x for p in pts), dtype=np.float64, count=len(pts))
+    ys = np.fromiter((p.y for p in pts), dtype=np.float64, count=len(pts))
+    if np.ptp(xs) <= 0 or np.ptp(ys) <= 0:
+        return None
+
+    hist, x_edges, y_edges = np.histogram2d(xs, ys, bins=grid)
+    populated = hist[hist >= 5]
+    if populated.size < 4:
+        return None
+
+    median = float(np.median(populated))
+    spike_cells = int(np.count_nonzero(hist > 2.0 * median))
+    spike_frac = spike_cells / populated.size
+
+    multipass_frac = 0.0
+    gps = np.fromiter((p.gps_time for p in pts), dtype=np.float64, count=len(pts))
+    if np.count_nonzero(gps > 0) > len(pts) * 0.5:
+        xi = np.clip(np.digitize(xs, x_edges) - 1, 0, grid - 1)
+        yi = np.clip(np.digitize(ys, y_edges) - 1, 0, grid - 1)
+        cell = xi * grid + yi
+        order = np.lexsort((gps, cell))
+        c_sorted, g_sorted = cell[order], gps[order]
+        new_seg = np.ones(len(g_sorted), dtype=bool)
+        new_seg[1:] = (c_sorted[1:] != c_sorted[:-1]) | (np.diff(g_sorted) > gap_seconds)
+        seg_id = np.cumsum(new_seg) - 1
+        seg_count = np.bincount(seg_id)
+        seg_cell = c_sorted[new_seg]
+        cell_count = np.bincount(cell, minlength=grid * grid)
+        qualifies = seg_count >= np.maximum(3, min_pass_fraction * cell_count[seg_cell])
+        passes_per_cell = np.bincount(seg_cell[qualifies], minlength=grid * grid)
+        multipass_cells = int(np.count_nonzero(passes_per_cell >= 2))
+        multipass_frac = multipass_cells / populated.size
+
+    if multipass_frac > 0.05:
+        return (
+            f"Overlap detected: {multipass_frac * 100:.0f}% of populated cells are covered by "
+            f"2+ distinct passes (GPS gap > {gap_seconds:.0f}s)"
+        )
+    if spike_frac > 0.10:
+        return (
+            f"Density anomaly: {spike_frac * 100:.0f}% of populated cells exceed 2x the "
+            f"median density (possible overlapping swaths)"
+        )
+    return None
+
+
 def compute_stats(las: LasFile) -> tuple[LasStats, list[QcWarning]]:
     hdr = las.header
     pts = las.points
@@ -479,7 +548,8 @@ def compute_stats(las: LasFile) -> tuple[LasStats, list[QcWarning]]:
 
         # Overlap detection: approx by checking many points with high number_of_returns
         # in close spatial area — simple proxy: flag if >5% are return 1-of-1
-        # Real overlap detection needs spatial binning; this is a placeholder.
+        # Overlap detection is performed after the loop via spatial binning
+        # (see _detect_overlap_cells).
 
     stats.classification_counts = dict(classifications)
     stats.return_counts = dict(returns)
@@ -522,9 +592,13 @@ def compute_stats(las: LasFile) -> tuple[LasStats, list[QcWarning]]:
     elif hdr.point_density > 1000:
         warnings.append(QcWarning("info", "density", f"High density: {hdr.point_density:.0f} pts/m²"))
 
-    # Simple overlap heuristic: if many points are return 1-of-1 and area coverage
-    # is high relative to point count, it may indicate overlapping flight lines.
-    if stats.return_counts.get(1, 0) > len(pts) * 0.7 and hdr.point_density > 200:
+    # Overlap heuristic: spatial binning (multi-pass GPS cells / density spikes) first,
+    # then the original fallback (high density + many 1st returns).
+    overlap_msg = _detect_overlap_cells(pts)
+    if overlap_msg:
+        stats.overlaps_detected = True
+        warnings.append(QcWarning("info", "overlap", overlap_msg))
+    elif stats.return_counts.get(1, 0) > len(pts) * 0.7 and hdr.point_density > 200:
         stats.overlaps_detected = True
         warnings.append(
             QcWarning("info", "overlap", "Possible overlap zone detected (high density + many 1st returns)")
@@ -612,12 +686,521 @@ def _cls_name(c: int) -> str:
     return CLASS_NAMES.get(c, f"Class {c}")
 
 
+def _detect_linear_unit(crs_wkt: str) -> tuple[str, float]:
+    """Return (unit_label, metres_per_unit) from CRS WKT text. Defaults to metres."""
+    import re
+
+    text = (crs_wkt or "").lower()
+    if re.search(r"us[\s_-]*survey[\s_-]*(foot|feet)|foot_us|ftus", text):
+        return "ft", 0.3048006096
+    if re.search(r"foot|feet|\bft\b|\"ft\"", text):
+        return "ft", 0.3048
+    return "m", 1.0
+
+
+def _build_3d_payload(las: LasFile, max_3d_points: int = 150_000) -> dict:
+    """Pack a compact, centroid-referenced binary payload for the WebGL viewer.
+
+    * Uniform deterministic stride subsample (<= ``max_3d_points`` points).
+    * float64 bbox/centroid are kept in metadata; XYZ is quantised to uint16 against
+      the float64 bbox, so the browser reconstructs ``(world - centroid)`` in float64
+      before casting to Float32 (no WebGL jitter on large projected coordinates).
+    * Binary layout (8 bytes/point), Base64 encoded in ``data_b64``:
+        xyz  : ``<u2`` x3 interleaved  @ offset 0
+        int. : ``u1``                  @ offset 6*n
+        class: ``u1``                  @ offset 7*n
+    """
+    pts = las.points
+    n_total = len(pts)
+    unit, metres_per_unit = _detect_linear_unit(las.header.crs_wkt)
+    tol_default = round(0.005 / metres_per_unit, 6)
+    base: dict = {
+        "n_points": 0,
+        "n_total": n_total,
+        "stride": 1,
+        "unit": unit,
+        "tol_default": tol_default,
+        "tol_max": round(0.25 / metres_per_unit, 6),
+        "bytes_per_point": 8,
+        "data_b64": "",
+    }
+    if n_total == 0 or max_3d_points <= 0:
+        return base
+
+    stride = max(1, math.ceil(n_total / max_3d_points))
+    sel = pts[::stride]
+    n = len(sel)
+
+    xyz = np.empty((n, 3), dtype=np.float64)
+    xyz[:, 0] = np.fromiter((p.x for p in sel), dtype=np.float64, count=n)
+    xyz[:, 1] = np.fromiter((p.y for p in sel), dtype=np.float64, count=n)
+    xyz[:, 2] = np.fromiter((p.z for p in sel), dtype=np.float64, count=n)
+    intensity = np.fromiter((p.intensity for p in sel), dtype=np.float64, count=n)
+    classification = np.fromiter((p.classification for p in sel), dtype=np.int64, count=n)
+
+    centroid = xyz.mean(axis=0)
+    bmin = xyz.min(axis=0)
+    bmax = xyz.max(axis=0)
+    span = bmax - bmin
+    span_safe = np.where(span > 0, span, 1.0)
+
+    q = np.rint((xyz - bmin) / span_safe * 65535.0).astype("<u2")
+    imax = max(1.0, float(intensity.max()))
+    i8 = np.rint(intensity / imax * 255.0).astype("u1")
+    c8 = np.clip(classification, 0, 255).astype("u1")
+
+    data = q.tobytes() + i8.tobytes() + c8.tobytes()
+    base.update(
+        {
+            "n_points": n,
+            "stride": stride,
+            "bbox_min": bmin.tolist(),
+            "bbox_max": bmax.tolist(),
+            "centroid": centroid.tolist(),
+            "min_z": float(bmin[2]),
+            "max_z": float(bmax[2]),
+            "intensity_max": imax,
+            "layout": {"xyz_u16": 0, "intensity_u8": 6 * n, "class_u8": 7 * n},
+            "data_b64": base64.b64encode(data).decode("ascii"),
+        }
+    )
+    return base
+
+
+_WEBGL_CSS = r"""
+  /* 3D WebGL section */
+  section.webgl-section { background: #151d30; border: 1px solid #24314f; border-radius: 16px;
+    padding: 1.5rem; box-shadow: 0 4px 10px rgba(0,0,0,0.15); margin-bottom: 1.5rem; }
+  section.webgl-section h2 { font-family: 'Outfit', sans-serif; font-size: 1.1rem; font-weight: 700;
+    color: #f8fafc; margin-bottom: 0.8rem; padding-bottom: 0.6rem; border-bottom: 1px solid #24314f; }
+  .subsample-badge { display: inline-block; background: rgba(56,189,248,0.1); border: 1px solid #38bdf8;
+    color: #7dd3fc; border-radius: 99px; padding: 0.2rem 0.8rem; font-size: 0.78rem; margin-bottom: 0.6rem; }
+  .offline-note { font-size: 0.78rem; color: #94a3b8; margin-bottom: 0.8rem; }
+  .webgl-offline { background: rgba(245,158,11,0.08); border-left: 4px solid #f59e0b; border-radius: 10px;
+    padding: 0.85rem 1rem; font-size: 0.85rem; color: #fcd34d; margin-bottom: 0.8rem; }
+  .webgl-offline[hidden] { display: none; }
+  .webgl-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.6rem 1rem;
+    margin-bottom: 1rem; }
+  .webgl-controls label { display: flex; flex-direction: column; font-size: 0.7rem; font-weight: 600;
+    color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; gap: 0.2rem; }
+  .webgl-controls label output { color: #e2e8f0; text-transform: none; letter-spacing: 0; font-weight: 500; }
+  .webgl-controls select, .webgl-controls input[type=range] { width: 100%; }
+  .webgl-controls select { background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px;
+    padding: 0.35rem; }
+  .webgl-controls .check { flex-direction: row; align-items: center; gap: 0.5rem; text-transform: none; }
+  #webgl-canvas-host { width: 100%; height: 520px; background: #0b0f19; border: 1px solid #334155;
+    border-radius: 12px; overflow: hidden; }
+  #webgl-canvas-host canvas { display: block; }
+  .webgl-legend { font-size: 0.75rem; color: #94a3b8; margin: 0.5rem 0 1rem; }
+  #profile-canvas { width: 100%; height: 260px; background: #0b0f19; border: 1px solid #334155;
+    border-radius: 12px; display: block; }
+  #profile-readout { font-size: 0.8rem; color: #cbd5e1; margin-top: 0.4rem; min-height: 1.3rem;
+    font-variant-numeric: tabular-nums; }
+  .webgl-subhead { font-family: 'Outfit', sans-serif; font-size: 0.95rem; color: #f8fafc; margin: 1.1rem 0 0.4rem; }
+"""
+
+_WEBGL_BODY = r"""
+  <section class="section webgl-section" id="webgl-section">
+    <h2>🧊 3D Point Cloud &amp; Corridor Profile</h2>
+    <div class="subsample-badge">__BADGE__</div>
+    <div class="offline-note">The 2D QC tables, charts and density heatmap in this report are 100% offline.
+      This interactive 3D WebGL viewer loads Three.js from the jsDelivr CDN and needs an internet connection.</div>
+    <div id="webgl-offline" class="webgl-offline" hidden>⚠ The 3D viewer could not load Three.js from the
+      jsDelivr CDN (are you offline?). All 2D QC content in this report remains fully available.</div>
+    <div class="webgl-controls">
+      <label>Color mode
+        <select id="c-mode">
+          <option value="0">Elevation (Z)</option>
+          <option value="1">ASPRS Classification</option>
+          <option value="2">Intensity</option>
+          <option value="3">Reference Datum ΔZ (Elevation Deviation)</option>
+        </select>
+      </label>
+      <label>Min Z clip <output id="o-minz"></output><input type="range" id="c-minz"></label>
+      <label>Max Z clip <output id="o-maxz"></output><input type="range" id="c-maxz"></label>
+      <label>Point size <output id="o-psize"></output><input type="range" id="c-psize" min="1" max="8" step="0.5" value="2"></label>
+      <label>Reference datum Z <output id="o-datum"></output><input type="range" id="c-datum"></label>
+      <label>Tolerance (green ±) <output id="o-tol"></output><input type="range" id="c-tol"></label>
+    </div>
+    <div class="webgl-legend" id="dz-legend">
+      Reference Datum ΔZ: signed vertical deviation Δz = z − z<sub>datum</sub> against an adjustable horizontal
+      reference plane (slab flatness / grading checks). It is not a Scan-vs-BIM mesh comparison.
+      <span id="dz-legend-live"></span>
+    </div>
+    <div id="webgl-canvas-host"></div>
+
+    <h3 class="webgl-subhead">Corridor cross-section (station vs. elevation)</h3>
+    <div class="webgl-controls">
+      <label>Azimuth (° from +X, 0–180) <output id="o-azim"></output><input type="range" id="c-azim" min="0" max="180" step="1" value="0"></label>
+      <label>Corridor width w <output id="o-w"></output><input type="range" id="c-w"></label>
+      <label>Corridor length L <output id="o-l"></output><input type="range" id="c-l"></label>
+      <label>Offset X <output id="o-ox"></output><input type="range" id="c-ox"></label>
+      <label>Offset Y <output id="o-oy"></output><input type="range" id="c-oy"></label>
+      <label class="check"><input type="checkbox" id="c-hl" checked> Highlight corridor points</label>
+      <label class="check"><input type="checkbox" id="c-iso"> Isolate corridor points</label>
+    </div>
+    <canvas id="profile-canvas"></canvas>
+    <div id="profile-readout">Hover the profile for station, elevation and world coordinates.</div>
+  </section>
+"""
+
+_WEBGL_IMPORTMAP = r"""
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+"""
+
+_WEBGL_JS = r"""
+<script type="module">
+const offlineBanner = document.getElementById('webgl-offline');
+const P = JSON.parse(document.getElementById('payload3d').textContent);
+const CLS = JSON.parse(document.getElementById('payload3d-cls').textContent);
+const $ = (id) => document.getElementById(id);
+
+(async function main() {
+  if (!P.n_points) {
+    offlineBanner.hidden = false;
+    offlineBanner.textContent = 'No points available for the 3D view.';
+    return;
+  }
+  let THREE, OrbitControls;
+  try {
+    THREE = await import('three');
+    ({ OrbitControls } = await import('three/addons/controls/OrbitControls.js'));
+  } catch (e) {
+    offlineBanner.hidden = false;
+    return;
+  }
+
+  // ── Decode quantised binary payload (float64 math, then Float32 centroid-centred) ──
+  const n = P.n_points, cen = P.centroid, bmin = P.bbox_min, bmax = P.bbox_max;
+  const span = [0, 1, 2].map((k) => bmax[k] - bmin[k]);
+  const bin = atob(P.data_b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const q = new Uint16Array(bytes.buffer, P.layout.xyz_u16, n * 3);
+  const pos = new Float32Array(n * 3);
+  const aInt = new Float32Array(n), aCls = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 3; k++) {
+      const w = bmin[k] + (span[k] > 0 ? (q[3 * i + k] / 65535) * span[k] : 0);
+      pos[3 * i + k] = w - cen[k];
+    }
+    aInt[i] = bytes[P.layout.intensity_u8 + i] / 255;
+    aCls[i] = bytes[P.layout.class_u8 + i];
+  }
+
+  const extXY = Math.max(span[0], span[1], 1e-6);
+  const extent = Math.max(span[0], span[1], span[2], 1e-6);
+  const diag = Math.hypot(span[0], span[1]) || 1;
+  const zc = cen[2];
+  const bboxC = [0, 1, 2].map((k) => (bmin[k] + bmax[k]) / 2 - cen[k]);
+  const fmt = (v, d = 3) => Number(v).toFixed(d);
+
+  // ── Three.js scene ──
+  const host = $('webgl-canvas-host');
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(host.clientWidth, host.clientHeight);
+  renderer.setClearColor(0x0b0f19, 1);
+  host.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, host.clientWidth / host.clientHeight, extent * 0.001, extent * 50);
+  camera.up.set(0, 0, 1);
+  camera.position.set(bboxC[0] + extent * 0.6, bboxC[1] - extent * 1.0, bboxC[2] + extent * 0.9);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(bboxC[0], bboxC[1], bboxC[2]);
+  controls.update();
+
+  const clsColors = [];
+  for (let i = 0; i < 32; i++) {
+    const hex = CLS[String(i)] || '#9e9e9e';
+    const c = new THREE.Color(hex);
+    clsColors.push(new THREE.Vector3(c.r, c.g, c.b));
+  }
+
+  const uniforms = {
+    uPointSize: { value: 2.0 },
+    uMinZ: { value: -1e9 }, uMaxZ: { value: 1e9 },
+    uZLo: { value: P.min_z - zc }, uZHi: { value: P.max_z - zc },
+    uMode: { value: 0 },
+    uDatum: { value: 0 }, uTol: { value: P.tol_default },
+    uCorrCenter: { value: new THREE.Vector2(0, 0) },
+    uCorrDir: { value: new THREE.Vector2(1, 0) },
+    uHalfW: { value: 1 }, uHalfL: { value: 1 },
+    uHighlight: { value: 1 }, uIsolate: { value: 0 },
+    uClsColors: { value: clsColors },
+  };
+
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: `
+      attribute float aIntensity;
+      attribute float aClass;
+      uniform float uPointSize, uMinZ, uMaxZ, uZLo, uZHi, uDatum, uTol, uHalfW, uHalfL;
+      uniform int uMode, uHighlight, uIsolate;
+      uniform vec3 uClsColors[32];
+      uniform vec2 uCorrCenter, uCorrDir;
+      varying vec3 vColor;
+
+      vec3 ramp(float t) {
+        t = clamp(t, 0.0, 1.0);
+        vec3 a = vec3(0.10, 0.20, 0.75), b = vec3(0.10, 0.75, 0.80),
+             c = vec3(0.25, 0.85, 0.30), d = vec3(0.98, 0.90, 0.20), e = vec3(0.90, 0.20, 0.15);
+        if (t < 0.25) return mix(a, b, t / 0.25);
+        if (t < 0.5)  return mix(b, c, (t - 0.25) / 0.25);
+        if (t < 0.75) return mix(c, d, (t - 0.5) / 0.25);
+        return mix(d, e, (t - 0.75) / 0.25);
+      }
+
+      void main() {
+        // GPU Z clipping
+        if (position.z < uMinZ || position.z > uMaxZ) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+          gl_PointSize = 0.0;
+          vColor = vec3(0.0);
+          return;
+        }
+        // Corridor membership: |d_perp| <= w/2 and |d_par| <= L/2
+        vec2 d = position.xy - uCorrCenter;
+        float par = dot(d, uCorrDir);
+        float perp = dot(d, vec2(-uCorrDir.y, uCorrDir.x));
+        bool inside = abs(perp) <= uHalfW && abs(par) <= uHalfL;
+        if (uIsolate == 1 && !inside) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+          gl_PointSize = 0.0;
+          vColor = vec3(0.0);
+          return;
+        }
+
+        vec3 col;
+        if (uMode == 0) {
+          col = ramp((position.z - uZLo) / max(uZHi - uZLo, 1e-9));
+        } else if (uMode == 1) {
+          int idx = int(clamp(aClass, 0.0, 31.0));
+          col = uClsColors[0];
+          for (int i = 0; i < 32; i++) { if (i == idx) col = uClsColors[i]; }
+        } else if (uMode == 2) {
+          col = vec3(aIntensity);
+        } else {
+          float dz = position.z - uDatum;
+          float g = uTol, r = 4.0 * uTol;
+          vec3 green = vec3(0.15, 0.80, 0.35), red = vec3(0.92, 0.15, 0.15), blue = vec3(0.15, 0.30, 0.95);
+          float a = abs(dz);
+          if (a <= g) col = green;
+          else col = mix(green, dz > 0.0 ? red : blue, clamp((a - g) / max(r - g, 1e-9), 0.0, 1.0));
+        }
+        if (uHighlight == 1 && inside) col = mix(col, vec3(1.0, 0.9, 0.2), 0.55);
+
+        vColor = col;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = uPointSize;
+      }`,
+    fragmentShader: `
+      varying vec3 vColor;
+      void main() {
+        if (length(gl_PointCoord - vec2(0.5)) > 0.5) discard;
+        gl_FragColor = vec4(vColor, 1.0);
+      }`,
+  });
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geom.setAttribute('aIntensity', new THREE.BufferAttribute(aInt, 1));
+  geom.setAttribute('aClass', new THREE.BufferAttribute(aCls, 1));
+  const points = new THREE.Points(geom, material);
+  points.frustumCulled = false;
+  scene.add(points);
+
+  // Corridor outline
+  const outlineGeom = new THREE.BufferGeometry();
+  outlineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(12), 3));
+  const outline = new THREE.LineLoop(outlineGeom, new THREE.LineBasicMaterial({ color: 0xfacc15 }));
+  outline.frustumCulled = false;
+  scene.add(outline);
+
+  const render = () => renderer.render(scene, camera);
+  controls.addEventListener('change', render);
+
+  // ── Controls ──
+  function setup(id, min, max, step, value) {
+    const el = $(id);
+    el.min = min; el.max = max; el.step = step; el.value = value;
+    return el;
+  }
+  const zStep = Math.max((P.max_z - P.min_z) / 1000, 1e-6);
+  const zMin = setup('c-minz', P.min_z, P.max_z, zStep, P.min_z);
+  const zMax = setup('c-maxz', P.min_z, P.max_z, zStep, P.max_z);
+  const datum = setup('c-datum', P.min_z, P.max_z, zStep, zc);
+  const tol = setup('c-tol', P.tol_default / 10, P.tol_max, P.tol_default / 10, P.tol_default);
+  const azim = $('c-azim');
+  const alongY = span[1] > span[0];
+  azim.value = alongY ? 90 : 0;  // default: corridor along the longer horizontal axis
+  const cw = setup('c-w', extXY / 200, extXY, extXY / 400, extXY / 10);
+  const cl = setup('c-l', extXY / 50, diag * 1.2, diag / 400, Math.max(span[0], span[1]) * 0.9);
+  const ox = setup('c-ox', -extXY / 2, extXY / 2, extXY / 400, 0);
+  const oy = setup('c-oy', -extXY / 2, extXY / 2, extXY / 400, 0);
+  const mode = $('c-mode');
+
+  function updateScene() {
+    const lo = Math.min(+zMin.value, +zMax.value), hi = Math.max(+zMin.value, +zMax.value);
+    uniforms.uMinZ.value = lo - zc;
+    uniforms.uMaxZ.value = hi - zc;
+    uniforms.uPointSize.value = +$('c-psize').value;
+    uniforms.uDatum.value = +datum.value - zc;
+    uniforms.uTol.value = +tol.value;
+    uniforms.uMode.value = +mode.value;
+    uniforms.uHighlight.value = $('c-hl').checked ? 1 : 0;
+    uniforms.uIsolate.value = $('c-iso').checked ? 1 : 0;
+    $('o-minz').textContent = fmt(lo); $('o-maxz').textContent = fmt(hi);
+    $('o-psize').textContent = $('c-psize').value;
+    $('o-datum').textContent = fmt(datum.value) + ' ' + P.unit;
+    $('o-tol').textContent = '±' + fmt(tol.value, 4) + ' ' + P.unit;
+    $('dz-legend-live').textContent =
+      ' Blue < −' + fmt(4 * tol.value, 4) + ' ' + P.unit + ' · Green ±' + fmt(tol.value, 4) + ' ' + P.unit +
+      ' · Red > +' + fmt(4 * tol.value, 4) + ' ' + P.unit +
+      ' (defaults: −20 mm / ±5 mm / +20 mm in metres).';
+    updateCorridor();
+  }
+
+  let corr = { cx: 0, cy: 0, dx: 1, dy: 0, hw: 1, hl: 1 };
+  function updateCorridor() {
+    const th = (+azim.value * Math.PI) / 180;
+    corr = { cx: +ox.value, cy: +oy.value, dx: Math.cos(th), dy: Math.sin(th), hw: +cw.value / 2, hl: +cl.value / 2 };
+    uniforms.uCorrCenter.value.set(corr.cx, corr.cy);
+    uniforms.uCorrDir.value.set(corr.dx, corr.dy);
+    uniforms.uHalfW.value = corr.hw;
+    uniforms.uHalfL.value = corr.hl;
+    $('o-azim').textContent = azim.value + '°';
+    $('o-w').textContent = fmt(cw.value) + ' ' + P.unit;
+    $('o-l').textContent = fmt(cl.value) + ' ' + P.unit;
+    $('o-ox').textContent = fmt(ox.value); $('o-oy').textContent = fmt(oy.value);
+    const z = +datum.value - zc;
+    const px = -corr.dy, py = corr.dx;
+    const arr = outlineGeom.attributes.position.array;
+    const cs = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+    cs.forEach(([a, b], i) => {
+      arr[3 * i] = corr.cx + corr.dx * a * corr.hl + px * b * corr.hw;
+      arr[3 * i + 1] = corr.cy + corr.dy * a * corr.hl + py * b * corr.hw;
+      arr[3 * i + 2] = z;
+    });
+    outlineGeom.attributes.position.needsUpdate = true;
+    render();
+    scheduleProfile();
+  }
+
+  // ── 2D stationing profile: station s vs elevation z ──
+  const pc = $('profile-canvas');
+  const pctx = pc.getContext('2d');
+  let prof = { px: null, py: null, idx: null, count: 0 };
+  let pending = false;
+  function scheduleProfile() {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; drawProfile(); });
+  }
+  function drawProfile() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = pc.clientWidth, H = pc.clientHeight;
+    pc.width = W * dpr; pc.height = H * dpr;
+    pctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    pctx.clearRect(0, 0, W, H);
+    const lo = uniforms.uMinZ.value, hi = uniforms.uMaxZ.value;
+    const L = corr.hl * 2;
+    const sArr = new Float32Array(n), zArr = new Float32Array(n), ids = new Int32Array(n);
+    let m = 0, zlo = Infinity, zhi = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const x = pos[3 * i] - corr.cx, y = pos[3 * i + 1] - corr.cy, z = pos[3 * i + 2];
+      if (z < lo || z > hi) continue;
+      const par = x * corr.dx + y * corr.dy;        // d_parallel (signed)
+      const perp = -x * corr.dy + y * corr.dx;      // d_perpendicular (signed)
+      if (Math.abs(perp) > corr.hw || Math.abs(par) > corr.hl) continue;
+      sArr[m] = par + corr.hl;                       // stationing (0 .. L)
+      zArr[m] = z; ids[m] = i; m++;
+      if (z < zlo) zlo = z;
+      if (z > zhi) zhi = z;
+    }
+    const ml = 64, mr = 12, mt = 12, mb = 42;
+    pctx.fillStyle = '#94a3b8'; pctx.font = '11px Inter, sans-serif';
+    if (!m) {
+      pctx.fillText('No points inside the corridor — adjust offset / width / length.', ml, H / 2);
+      prof = { px: null, py: null, idx: null, count: 0 };
+      return;
+    }
+    if (zhi - zlo < 1e-9) { zlo -= 0.5; zhi += 0.5; }
+    const pad = (zhi - zlo) * 0.05; zlo -= pad; zhi += pad;
+    const X = (s) => ml + (s / L) * (W - ml - mr);
+    const Y = (z) => H - mb - ((z - zlo) / (zhi - zlo)) * (H - mt - mb);
+    // axes
+    pctx.strokeStyle = '#334155'; pctx.lineWidth = 1;
+    pctx.strokeRect(ml, mt, W - ml - mr, H - mt - mb);
+    for (let t = 0; t <= 4; t++) {
+      const s = (L * t) / 4, zz = zlo + ((zhi - zlo) * t) / 4;
+      pctx.fillText(fmt(s, 1), Math.min(X(s) - 12, W - mr - 30), H - 26);
+      pctx.fillText(fmt(zz + zc, 2), 4, Y(zz) + 4);
+      pctx.beginPath(); pctx.moveTo(ml, Y(zz)); pctx.lineTo(W - mr, Y(zz));
+      pctx.strokeStyle = '#1e293b'; pctx.stroke();
+    }
+    pctx.fillText('Station s (' + P.unit + ')', W / 2 - 40, H - 8);
+    // datum line
+    const dz = +datum.value - zc;
+    if (dz > zlo && dz < zhi) {
+      pctx.strokeStyle = '#f59e0b'; pctx.setLineDash([5, 4]);
+      pctx.beginPath(); pctx.moveTo(ml, Y(dz)); pctx.lineTo(W - mr, Y(dz)); pctx.stroke();
+      pctx.setLineDash([]);
+    }
+    // points
+    const px = new Float32Array(m), py = new Float32Array(m);
+    pctx.fillStyle = '#38bdf8';
+    for (let k = 0; k < m; k++) {
+      px[k] = X(sArr[k]); py[k] = Y(zArr[k]);
+      pctx.fillRect(px[k] - 1, py[k] - 1, 2, 2);
+    }
+    prof = { px, py, idx: ids.subarray(0, m), count: m, sArr, zArr };
+    $('profile-readout').textContent = m.toLocaleString() + ' points in corridor — hover for readout.';
+  }
+  pc.addEventListener('mousemove', (ev) => {
+    if (!prof.count) return;
+    const r = pc.getBoundingClientRect();
+    const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    let best = -1, bd = 12 * 12;
+    for (let k = 0; k < prof.count; k++) {
+      const dx = prof.px[k] - mx, dy = prof.py[k] - my, d2 = dx * dx + dy * dy;
+      if (d2 < bd) { bd = d2; best = k; }
+    }
+    if (best < 0) return;
+    const i = prof.idx[best];
+    const E = pos[3 * i] + cen[0], N = pos[3 * i + 1] + cen[1], Z = pos[3 * i + 2] + cen[2];
+    $('profile-readout').textContent =
+      'Station s = ' + fmt(prof.sArr[best], 3) + ' ' + P.unit + '  |  Elevation z = ' + fmt(Z, 3) +
+      '  |  E = ' + fmt(E, 3) + '  N = ' + fmt(N, 3);
+  });
+
+  ['c-mode', 'c-minz', 'c-maxz', 'c-psize', 'c-datum', 'c-tol', 'c-azim', 'c-w', 'c-l', 'c-ox', 'c-oy', 'c-hl', 'c-iso']
+    .forEach((id) => $(id).addEventListener('input', updateScene));
+  window.addEventListener('resize', () => {
+    renderer.setSize(host.clientWidth, host.clientHeight);
+    camera.aspect = host.clientWidth / host.clientHeight;
+    camera.updateProjectionMatrix();
+    render(); scheduleProfile();
+  });
+  updateScene();
+})();
+</script>
+"""
+
+
 def generate_html_report(
     las: LasFile,
     stats: LasStats,
     warnings: list[QcWarning],
     density_png_path: str | None = None,
     filename: str = "",
+    max_3d_points: int = 150_000,
 ) -> str:
     """Return a self-contained HTML string."""
     hdr = las.header
@@ -670,6 +1253,24 @@ def generate_html_report(
     if not warn_cards:
         warn_cards = '<div class="qcw ok"><span class="icon">✅</span><span class="msg">No issues detected.</span></div>'
 
+    # 3D WebGL viewer (centroid-centred, u16-quantised payload)
+    payload = _build_3d_payload(las, max_3d_points=max_3d_points)
+    badge = (
+        f"Rendering {payload['n_points']:,} of {payload['n_total']:,} points "
+        f"(uniform stride subsample)"
+    )
+    webgl_section = _WEBGL_BODY.replace("__BADGE__", badge)
+    webgl_scripts = (
+        _WEBGL_IMPORTMAP
+        + '<script id="payload3d" type="application/json">'
+        + json.dumps(payload)
+        + "</script>\n"
+        + '<script id="payload3d-cls" type="application/json">'
+        + json.dumps({str(k): v for k, v in CLS_COLORS.items()})
+        + "</script>\n"
+        + _WEBGL_JS
+    )
+
     # Density image embed (inline base64)
     density_img = ""
     if density_png_path and os.path.exists(density_png_path):
@@ -683,6 +1284,7 @@ def generate_html_report(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<link rel="icon" href="data:,">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="description" content="Automated Quality Control (QC) report for LiDAR Point Cloud data generated by las-inspector.">
 <title>las-inspector QC Report - {filename}</title>
@@ -916,6 +1518,7 @@ def generate_html_report(
     main.hero {{ grid-template-columns: 1fr; }}
     .mini-grid {{ grid-template-columns: 1fr; }}
   }}
+{_WEBGL_CSS}
 </style>
 </head>
 <body>
@@ -1025,6 +1628,8 @@ def generate_html_report(
 
   </div>
 
+  {webgl_section}
+
   <!-- Density & Elevation -->
   <section class="section density-section">
     <h2>🗺 Density & Elevation</h2>
@@ -1039,6 +1644,7 @@ def generate_html_report(
   </footer>
 
 </div>
+{webgl_scripts}
 </body>
 </html>"""
 
@@ -1065,6 +1671,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", "-o", default=None, help="Output HTML report path")
     parser.add_argument("--density", action="store_true", help="Generate density heatmap (PNG)")
     parser.add_argument("--max-points", type=int, default=None, help="Max points to read (for testing)")
+    parser.add_argument(
+        "--max-3d-points",
+        type=int,
+        default=150_000,
+        help="Max points embedded in the interactive 3D viewer (uniform stride subsample, default 150000)",
+    )
     return parser
 
 
@@ -1136,7 +1748,14 @@ def main(argv: list[str] | None = None) -> int:
     # HTML report
     output_path = args.output or "qc_report.html"
     print(f"📄 Generating report → {output_path} ...")
-    html = generate_html_report(las, stats, warnings, density_png_path=density_png, filename=las.filename)
+    html = generate_html_report(
+        las,
+        stats,
+        warnings,
+        density_png_path=density_png,
+        filename=las.filename,
+        max_3d_points=args.max_3d_points,
+    )
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(html)

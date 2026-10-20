@@ -4,6 +4,8 @@ A lightweight Python CLI tool designed to ingest standard ASPRS LAS/LAZ point cl
 
 ![las-inspector QC report](report-preview.png)
 
+![3D WebGL point cloud viewer and corridor cross-section profile](report-preview-3d.png)
+
 > 📄 **[View a live example report](https://gokserpirik.github.io/las-inspector/example-report.html)** — or open [`example-report.html`](example-report.html) locally.
 
 > ℹ️
@@ -123,7 +125,8 @@ To customize the CLI run behavior and thresholds, adjust the command-line option
 * **`--output`, `-o`:** Name of the output HTML report (defaults to `qc_report.html`).
 * **`--density`:** Generates a dual-plot PNG showing the 2D Point Density heatmap and terrain-colored elevation scatter.
 * **`--max-points`:** Limits the number of points processed (useful for rapid testing on massive files).
-* **Overlap detection:** runs automatically on every file — possible flight-line overlap zones are reported as info-level warnings.
+* **`--max-3d-points`:** Max points embedded in the interactive 3D viewer (uniform stride subsample, default `150000`).
+* **Overlap detection:** runs automatically on every file — possible flight-line overlap zones are reported as info-level warnings. For files of 1,000+ points, points are binned on a 32×32 grid (`np.histogram2d`) and flagged when cells contain ≥2 distinct passes (GPS gap > 120 s, each pass ≥10% of the cell's points and ≥3 points) or density spikes; the original "high density + many 1st returns" check remains as a fallback.
 
 ### Modifying Heuristic Thresholds
 Open `las_inspector.py` and modify the following conditional checks in `compute_stats()` to fit your project standards:
@@ -174,6 +177,18 @@ python las_inspector.py data/sample.laz --density --output qc_report.html
 
 To build the sample yourself from a large tile: `python scripts/make_sample.py las2018.laz --output data/sample.laz --stride 22`.
 
+### 🧊 3D WebGL Point Cloud Inspector & Corridor Profile
+
+Every report embeds an interactive Three.js 3D viewer (still 100% pure Python on the generator side — no Node/npm build step):
+
+* **Compact payload:** up to 150k points (uniform stride subsample), XYZ quantized to `uint16` against the float64 bounding box, intensity and classification as `uint8` (8 bytes/point, ~1.6 MB Base64). The float64 centroid is stored in the report and subtracted in the browser before casting to `Float32`, so large projected coordinates (e.g. Dutch RD New) render without jitter. A badge shows `Rendering N of M points (uniform stride subsample)`.
+* **Color modes:** Elevation, ASPRS Classification, Intensity, and **Reference Datum ΔZ (Elevation Deviation)**.
+* **GPU Z-slicing:** Min/Max Z clip sliders and point-size control run in the vertex shader (discarded points at full frame rate).
+* **Reference Datum ΔZ:** computes the signed vertical deviation Δz = z − z_datum against an adjustable horizontal reference plane (slab flatness / grading checks). The default pass band is ±5 mm green and ±20 mm blue/red when the CRS WKT indicates metres; for foot-based CRSs the tolerance is converted automatically, and the tolerance slider adjusts the band for any unit system. This is **not** a Scan-vs-BIM mesh comparison.
+* **Civil alignment corridor profile:** azimuth (0–180°), width *w*, length *L*, and offset X/Y sliders define the cut plane (|d⊥| ≤ w/2) and half plane (|d∥| ≤ L/2). Points in the corridor are plotted on a live 2D canvas as stationing *s* vs. elevation *z*, with station, elevation, and world E/N hover readouts, plus highlight/isolate toggles in 3D. The profile reflects the embedded subsample.
+
+> **Offline behavior:** the 2D QC tables, charts, and density heatmap are 100% offline. The 3D viewer loads Three.js from the jsDelivr CDN via an import map; when offline, a notice banner is shown instead and the rest of the report still works.
+
 ### Output Files & Visualizations
 
 The script generates three key deliverables (names derive from your input/output paths):
@@ -193,7 +208,7 @@ uv sync
 .venv/bin/python -m pytest tests/ -v
 ```
 
-40 tests covering header math, bitfield unpacking, QC stats, binary LAS parsing, reports, and the CLI.
+46 tests covering header math, bitfield unpacking, QC stats, binary LAS parsing, reports, and the CLI.
 
 ## 📄 License
 
